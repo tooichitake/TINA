@@ -172,6 +172,7 @@ environment.txt
 tune_epf_baseline.py
 tune.py
 .claude/
+.vscode/
 .DS_Store
 
 # Files exceeding GitHub 100MB limit

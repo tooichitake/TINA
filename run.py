@@ -6,11 +6,7 @@ import numpy as np
 import torch
 import torch.backends
 
-from exp.exp_anomaly_detection import Exp_Anomaly_Detection
-from exp.exp_classification import Exp_Classification
-from exp.exp_imputation import Exp_Imputation
 from exp.exp_long_term_forecasting import Exp_Long_Term_Forecast
-from exp.exp_short_term_forecasting import Exp_Short_Term_Forecast
 from utils.print_args import print_args
 
 if __name__ == "__main__":
@@ -343,6 +339,12 @@ if __name__ == "__main__":
         help="kernel size for neighborhood attention",
     )
     parser.add_argument(
+        "--cross_kernel_size",
+        type=int,
+        default=7,
+        help="kernel size for neighborhood cross-attention (MANTA)",
+    )
+    parser.add_argument(
         "--na_dilation",
         type=int,
         default=1,
@@ -373,18 +375,7 @@ if __name__ == "__main__":
     print("Args in experiment:")
     print_args(args)
 
-    if args.task_name == "long_term_forecast":
-        Exp = Exp_Long_Term_Forecast
-    elif args.task_name == "short_term_forecast":
-        Exp = Exp_Short_Term_Forecast
-    elif args.task_name == "imputation":
-        Exp = Exp_Imputation
-    elif args.task_name == "anomaly_detection":
-        Exp = Exp_Anomaly_Detection
-    elif args.task_name == "classification":
-        Exp = Exp_Classification
-    else:
-        Exp = Exp_Long_Term_Forecast
+    Exp = Exp_Long_Term_Forecast
 
     if args.is_training:
         for ii in range(args.itr):

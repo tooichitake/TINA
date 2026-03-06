@@ -1,80 +1,76 @@
+import importlib
 import os
 import torch
-from models.Autoformer import Model as Autoformer
-from models.Transformer import Model as Transformer
-from models.TimesNet import Model as TimesNet
-from models.Nonstationary_Transformer import Model as Nonstationary_Transformer
-from models.DLinear import Model as DLinear
-from models.FEDformer import Model as FEDformer
-from models.Informer import Model as Informer
-from models.LightTS import Model as LightTS
-from models.Reformer import Model as Reformer
-from models.ETSformer import Model as ETSformer
-from models.Pyraformer import Model as Pyraformer
-from models.PatchTST import Model as PatchTST
-from models.MICN import Model as MICN
-from models.Crossformer import Model as Crossformer
-from models.FiLM import Model as FiLM
-from models.iTransformer import Model as iTransformer
-from models.Koopa import Model as Koopa
-from models.TiDE import Model as TiDE
-from models.FreTS import Model as FreTS
-from models.TimeMixer import Model as TimeMixer
-from models.TSMixer import Model as TSMixer
-from models.SegRNN import Model as SegRNN
-from models.MambaSimple import Model as MambaSimple
-from models.TemporalFusionTransformer import Model as TemporalFusionTransformer
-from models.SCINet import Model as SCINet
-from models.PAttn import Model as PAttn
-from models.TimeXer import Model as TimeXer
-from models.WPMixer import Model as WPMixer
-from models.MultiPatchFormer import Model as MultiPatchFormer
-from models.KANAD import Model as KANAD
-from models.TINA import Model as TINA
+
+# Lazy model registry: model_name -> module_path
+_MODEL_REGISTRY = {
+    "TimesNet": "models.TimesNet",
+    "Autoformer": "models.Autoformer",
+    "Transformer": "models.Transformer",
+    "Nonstationary_Transformer": "models.Nonstationary_Transformer",
+    "DLinear": "models.DLinear",
+    "FEDformer": "models.FEDformer",
+    "Informer": "models.Informer",
+    "LightTS": "models.LightTS",
+    "Reformer": "models.Reformer",
+    "ETSformer": "models.ETSformer",
+    "Pyraformer": "models.Pyraformer",
+    "PatchTST": "models.PatchTST",
+    "MICN": "models.MICN",
+    "Crossformer": "models.Crossformer",
+    "FiLM": "models.FiLM",
+    "iTransformer": "models.iTransformer",
+    "Koopa": "models.Koopa",
+    "TiDE": "models.TiDE",
+    "FreTS": "models.FreTS",
+    "MambaSimple": "models.MambaSimple",
+    "TimeMixer": "models.TimeMixer",
+    "TSMixer": "models.TSMixer",
+    "SegRNN": "models.SegRNN",
+    "TemporalFusionTransformer": "models.TemporalFusionTransformer",
+    "SCINet": "models.SCINet",
+    "PAttn": "models.PAttn",
+    "TimeXer": "models.TimeXer",
+    "WPMixer": "models.WPMixer",
+    "MultiPatchFormer": "models.MultiPatchFormer",
+    "KANAD": "models.KANAD",
+    "MANTA": "models.MANTA",
+    "MANTA_origin": "models.MANTA_origin",
+    "MANTA3": "models.MANTA3",
+    "Mamba": "models.Mamba",
+}
+
+# Cache for already-imported model classes
+_loaded_models = {}
+
+
+def get_model_class(model_name):
+    """Lazily import and return the Model class for the given model name."""
+    if model_name not in _loaded_models:
+        if model_name not in _MODEL_REGISTRY:
+            raise ValueError(
+                f"Unknown model: {model_name}. "
+                f"Available: {sorted(_MODEL_REGISTRY.keys())}"
+            )
+        module = importlib.import_module(_MODEL_REGISTRY[model_name])
+        _loaded_models[model_name] = module.Model
+    return _loaded_models[model_name]
+
+
+class _LazyModelDict:
+    """Dict-like object that imports model classes on first access."""
+
+    def __getitem__(self, model_name):
+        return get_model_class(model_name)
+
+    def __contains__(self, model_name):
+        return model_name in _MODEL_REGISTRY
 
 
 class Exp_Basic(object):
     def __init__(self, args):
         self.args = args
-        self.model_dict = {
-            "TimesNet": TimesNet,
-            "Autoformer": Autoformer,
-            "Transformer": Transformer,
-            "Nonstationary_Transformer": Nonstationary_Transformer,
-            "DLinear": DLinear,
-            "FEDformer": FEDformer,
-            "Informer": Informer,
-            "LightTS": LightTS,
-            "Reformer": Reformer,
-            "ETSformer": ETSformer,
-            "PatchTST": PatchTST,
-            "Pyraformer": Pyraformer,
-            "MICN": MICN,
-            "Crossformer": Crossformer,
-            "FiLM": FiLM,
-            "iTransformer": iTransformer,
-            "Koopa": Koopa,
-            "TiDE": TiDE,
-            "FreTS": FreTS,
-            "MambaSimple": MambaSimple,
-            "TimeMixer": TimeMixer,
-            "TSMixer": TSMixer,
-            "SegRNN": SegRNN,
-            "TemporalFusionTransformer": TemporalFusionTransformer,
-            "SCINet": SCINet,
-            "PAttn": PAttn,
-            "TimeXer": TimeXer,
-            "WPMixer": WPMixer,
-            "MultiPatchFormer": MultiPatchFormer,
-            "KANAD": KANAD,
-            "TINA": TINA,
-        }
-        if args.model == "Mamba":
-            print("Please make sure you have successfully installed mamba_ssm")
-            from models import Mamba
-
-            self.model_dict["Mamba"] = Mamba
-
+        self.model_dict = _LazyModelDict()
         self.device = self._acquire_device()
         self.model = self._build_model().to(self.device)
 

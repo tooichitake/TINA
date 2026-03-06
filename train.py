@@ -1,79 +1,278 @@
-import subprocess
-import sys
+﻿"""
+train.py -- Direct training loop matching tune_tina2.py exactly.
+No Exp class, no checkpoint saving.
+"""
 
-cmd = [
-    sys.executable,
-    "-u",
-    "run.py",
-    "--task_name",
-    "long_term_forecast",
-    "--is_training",
-    "1",
-    "--root_path",
-    "./datasets/ETT-small/",
-    "--data_path",
-    "ETTh1.csv",
-    "--model_id",
-    "ETTh1_MS_96_720",
-    "--model",
-    "TINA",
-    "--data",
-    "ETTh1",
-    "--features",
-    "MS",
-    "--target",
-    "OT",
-    "--freq",
-    "h",
-    "--seq_len",
-    "96",
-    "--label_len",
-    "48",
-    "--pred_len",
-    "720",
-    "--enc_in",
-    "7",
-    "--dec_in",
-    "7",
-    "--c_out",
-    "7",
-    "--d_model",
-    "256",
-    "--d_ff",
-    "768",
-    "--n_heads",
-    "4",
-    "--e_layers",
-    "2",
-    "--factor",
-    "1",
-    "--patch_len",
-    "8",
-    "--na_kernel_size",
-    "9",
-    "--batch_size",
-    "32",
-    "--patience",
-    "3",
-    "--learning_rate",
-    "0.0007339387616994463",
-    "--dropout",
-    "0.12304281196389771",
-    "--lradj",
-    "type3",
-    "--activation",
-    "relu",
-    "--train_epochs",
-    "5",
-    "--num_workers",
-    "0",
-    "--itr",
-    "1",
-    "--des",
-    "Exp",
-]
+import argparse
+import copy
+import gc
+import math
+import random
+
+import numpy as np
+import torch
+import torch.backends
+import torch.nn as nn
+from torch import optim
+
+from data_provider.data_factory import data_provider
+from exp.exp_basic import get_model_class
+from utils.metrics import metric
+
+
+def fix_random_seed(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+def adjust_learning_rate(optimizer, epoch, args):
+    if args.lradj == "type1":
+        lr_adjust = {epoch: args.learning_rate * (0.5 ** ((epoch - 1) // 1))}
+    elif args.lradj == "type2":
+        lr_adjust = {
+            2: 5e-5,
+            4: 1e-5,
+            6: 5e-6,
+            8: 1e-6,
+            10: 5e-7,
+            15: 1e-7,
+            20: 5e-8,
+        }
+    elif args.lradj == "type3":
+        lr_adjust = {
+            epoch: (
+                args.learning_rate
+                if epoch < 3
+                else args.learning_rate * (0.9 ** ((epoch - 3) // 1))
+            )
+        }
+    elif args.lradj == "cosine":
+        lr_adjust = {
+            epoch: args.learning_rate
+            / 2
+            * (1 + math.cos(epoch / args.train_epochs * math.pi))
+        }
+    if epoch in lr_adjust.keys():
+        lr = lr_adjust[epoch]
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+
+
+def vali(model, vali_loader, criterion, args, device):
+    model.eval()
+    total_loss = []
+    with torch.no_grad():
+        for batch_x, batch_y, batch_x_mark, batch_y_mark in vali_loader:
+            batch_x = batch_x.float().to(device)
+            batch_y = batch_y.float()
+            batch_x_mark = batch_x_mark.float().to(device)
+            batch_y_mark = batch_y_mark.float().to(device)
+            dec_inp = torch.zeros_like(batch_y[:, -args.pred_len :, :]).float()
+            dec_inp = (
+                torch.cat([batch_y[:, : args.label_len, :], dec_inp], dim=1)
+                .float()
+                .to(device)
+            )
+            outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+            f_dim = -1 if args.features == "MS" else 0
+            outputs = outputs[:, -args.pred_len :, f_dim:]
+            batch_y = batch_y[:, -args.pred_len :, f_dim:].to(device)
+            loss = criterion(outputs.detach(), batch_y.detach())
+            total_loss.append(loss.item())
+    model.train()
+    return np.average(total_loss)
+
+
+def test_evaluate(model, test_loader, args, device):
+    model.eval()
+    preds, trues = [], []
+    with torch.no_grad():
+        for batch_x, batch_y, batch_x_mark, batch_y_mark in test_loader:
+            batch_x = batch_x.float().to(device)
+            batch_y = batch_y.float().to(device)
+            batch_x_mark = batch_x_mark.float().to(device)
+            batch_y_mark = batch_y_mark.float().to(device)
+            dec_inp = torch.zeros_like(batch_y[:, -args.pred_len :, :]).float()
+            dec_inp = (
+                torch.cat([batch_y[:, : args.label_len, :], dec_inp], dim=1)
+                .float()
+                .to(device)
+            )
+            outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+            f_dim = -1 if args.features == "MS" else 0
+            outputs = outputs[:, -args.pred_len :, :].detach().cpu().numpy()
+            batch_y = batch_y[:, -args.pred_len :, :].detach().cpu().numpy()
+            preds.append(outputs[:, :, f_dim:])
+            trues.append(batch_y[:, :, f_dim:])
+    preds = np.concatenate(preds, axis=0).reshape(
+        -1, preds[0].shape[-2], preds[0].shape[-1]
+    )
+    trues = np.concatenate(trues, axis=0).reshape(
+        -1, trues[0].shape[-2], trues[0].shape[-1]
+    )
+    mae, mse, rmse, mape, mspe = metric(preds, trues)
+    model.train()
+    return mse, mae
+
+
+FIXED = {
+    "task_name": "long_term_forecast",
+    "model": "MANTA",
+    "model_id": "test",
+    "features": "MS",
+    "target": "OT",
+    "freq": "h",
+    "data": "ETTh1",
+    "root_path": "./datasets/ETT-small/",
+    "data_path": "ETTh1.csv",
+    "seasonal_patterns": "Monthly",
+    "embed": "timeF",
+    "num_workers": 0,
+    "augmentation_ratio": 0,
+    "enc_in": 7,
+    "dec_in": 7,
+    "c_out": 7,
+    "seq_len": 96,
+    "label_len": 48,
+    "batch_size": 64,
+    "train_epochs": 10,
+    "patience": 3,
+    "use_gpu": True,
+    "gpu": 0,
+}
+
+BEST_CONFIGS = {
+    720: dict(d_model=128, d_ff=128, n_heads=4, e_layers=2, patch_len=32,
+              learning_rate=0.0007, dropout=0.25,
+              lradj="type3", activation="relu"),
+}
+
+
+def make_args(pred_len):
+    config = {**FIXED, "pred_len": pred_len, **BEST_CONFIGS[pred_len]}
+    args = argparse.Namespace(**config)
+    if torch.cuda.is_available() and args.use_gpu:
+        args.device = torch.device("cuda:{}".format(args.gpu))
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        args.device = torch.device("mps")
+    else:
+        args.device = torch.device("cpu")
+    return args
+
+
+def run_training(args):
+    device = args.device
+
+    ModelClass = get_model_class(args.model)
+    model = ModelClass(args).float().to(device)
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Params: {n_params:,}")
+
+    _, train_loader = data_provider(args, flag="train")
+    _, vali_loader = data_provider(args, flag="val")
+    _, test_loader = data_provider(args, flag="test")
+    model_optim = optim.Adam(model.parameters(), lr=args.learning_rate)
+    criterion = nn.MSELoss()
+
+    best_vali_loss = np.inf
+    best_model_state = None
+    patience_counter = 0
+
+    for epoch in range(args.train_epochs):
+        model.train()
+        train_losses = []
+        for batch_x, batch_y, batch_x_mark, batch_y_mark in train_loader:
+            model_optim.zero_grad()
+            batch_x = batch_x.float().to(device)
+            batch_y = batch_y.float().to(device)
+            batch_x_mark = batch_x_mark.float().to(device)
+            batch_y_mark = batch_y_mark.float().to(device)
+            dec_inp = torch.zeros_like(batch_y[:, -args.pred_len :, :]).float()
+            dec_inp = (
+                torch.cat([batch_y[:, : args.label_len, :], dec_inp], dim=1)
+                .float()
+                .to(device)
+            )
+
+            outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+            f_dim = -1 if args.features == "MS" else 0
+            outputs = outputs[:, -args.pred_len :, f_dim:]
+            batch_y = batch_y[:, -args.pred_len :, f_dim:].to(device)
+            loss = criterion(outputs, batch_y)
+
+            loss.backward()
+            model_optim.step()
+
+            train_losses.append(loss.item())
+
+        train_loss = np.average(train_losses)
+        vali_loss = vali(model, vali_loader, criterion, args, device)
+        test_loss = vali(model, test_loader, criterion, args, device)
+
+        print(
+            f"  Epoch {epoch+1} | Train: {train_loss:.7f} "
+            f"Vali: {vali_loss:.7f} Test: {test_loss:.7f}"
+        )
+
+        if vali_loss < best_vali_loss:
+            best_vali_loss = vali_loss
+            best_model_state = copy.deepcopy(model.state_dict())
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            print(f"  EarlyStopping counter: {patience_counter} out of {args.patience}")
+            if patience_counter >= args.patience:
+                print("  Early stopping")
+                break
+
+        adjust_learning_rate(model_optim, epoch + 1, args)
+
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+
+    test_mse, test_mae = test_evaluate(model, test_loader, args, device)
+
+    del model, model_optim
+    del train_loader, vali_loader, test_loader
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return test_mse, test_mae
+
 
 if __name__ == "__main__":
-    print("Running TINA on ETTh1 MS with pred_len=720")
+    header = "MANTA Reproduction - ETTh1 MS"
+    pred_lens = list(BEST_CONFIGS.keys())
+    print(header)
+    print(f"Pred lens: {pred_lens}")
     print("=" * 60)
-    subprocess.run(cmd)
+
+    results = []
+    for pred_len in BEST_CONFIGS:
+        print(f"\n{'='*60}")
+        print(f"pred_len={pred_len}")
+        print(f"{'='*60}")
+
+        fix_random_seed(2021)
+        args = make_args(pred_len)
+        print(f"  Device: {args.device}")
+        print(f"  d_model={args.d_model}, n_heads={args.n_heads}, "
+              f"e_layers={args.e_layers}, patch_len={args.patch_len}")
+
+        test_mse, test_mae = run_training(args)
+        line = f"pred_len={pred_len} | MSE={test_mse:.6f}, MAE={test_mae:.6f}"
+        print(f"  >> {line}")
+        results.append(line)
+
+    with open("results.txt", "a") as f:
+        f.write(header + "\n")
+        f.write("=" * 60 + "\n")
+        for line in results:
+            f.write(line + "\n")
+    print("\nResults saved to results.txt")
